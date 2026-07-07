@@ -2,6 +2,8 @@
 
 Serverless visitor counter API built as part of the [Cloud Resume Challenge](https://cloudresumechallenge.dev/) (Azure Edition). This repo powers the visitor counter displayed on my resume site at [resume.carlosbergante.com](https://resume.carlosbergante.com).
 
+See the [cloud-resume-frontend](https://github.com/cbergante/Cloud-resume-frontend) repo for the site itself.
+
 ## Overview
 
 This is a Python-based Azure Function that reads and increments a visitor count stored in Azure Cosmos DB (Table API), triggered via a simple HTTP request from the front-end resume site's JavaScript.
@@ -52,8 +54,8 @@ No authentication required (anonymous access) — this endpoint is designed to b
 
 ```bash
 # Clone the repo
-git clone https://github.com/cbergante/resumechallenge.git
-cd resumechallenge
+git clone https://github.com/cbergante/Cloud-Resume-backend.git
+cd Cloud-Resume-backend
 
 # Create and activate a virtual environment
 python -m venv .venv
@@ -97,7 +99,7 @@ Part of an ongoing Cloud Resume Challenge build. Current progress:
 - [x] Static resume site hosted on Azure Storage, served via Cloudflare (CDN + HTTPS + custom domain)
 - [x] Cosmos DB (Table API) provisioned
 - [x] Azure Function built and deployed
-- [ ] Front-end/back-end integration (JavaScript fetch + CORS)
+- [x] Front-end/back-end integration (JavaScript fetch + CORS)
 - [ ] Automated tests
 - [ ] Infrastructure as Code (Bicep/Terraform)
 - [ ] CI/CD via GitHub Actions
