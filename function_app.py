@@ -55,16 +55,27 @@ def log_visit(req: func.HttpRequest, table_service: TableServiceClient):
 
     city, region, country = "unknown", "unknown", "unknown"
     if ip_address != "unknown":
-        geo_response = requests.get(
-            f"http://ip-api.com/json/{ip_address}?fields=status,city,regionName,country",
-            timeout=3
-        )
-        if geo_response.ok:
-            geo_data = geo_response.json()
-            if geo_data.get("status") == "success":
-                city = geo_data.get("city", "unknown")
-                region = geo_data.get("regionName", "unknown")
-                country = geo_data.get("country", "unknown")
+        try:
+            geo_response = requests.get(
+                f"http://ip-api.com/json/{ip_address}?fields=status,message,city,regionName,country",
+                timeout=3
+            )
+            if geo_response.ok:
+                geo_data = geo_response.json()
+                if geo_data.get("status") == "success":
+                    city = geo_data.get("city", "unknown")
+                    region = geo_data.get("regionName", "unknown")
+                    country = geo_data.get("country", "unknown")
+                else:
+                    logging.warning(
+                        f"Geo lookup returned non-success status for {ip_address}: {geo_data}"
+                    )
+            else:
+                logging.warning(
+                    f"Geo lookup HTTP error for {ip_address}: {geo_response.status_code} - {geo_response.text}"
+                )
+        except requests.exceptions.RequestException as e:
+            logging.warning(f"Geo lookup request failed for {ip_address}: {e}")
 
     log_table = table_service.get_table_client(table_name="VisitorLog")
     log_entity = {
