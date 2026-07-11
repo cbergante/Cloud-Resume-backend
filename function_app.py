@@ -3,11 +3,14 @@ import logging
 import os
 import uuid
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from azure.data.tables import TableServiceClient
 from azure.core.exceptions import ResourceNotFoundError
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
+
+RETENTION_DAYS = 365
+
 
 @app.route(route="visitorcounter")
 def visitorcounter(req: func.HttpRequest) -> func.HttpResponse:
@@ -102,3 +105,38 @@ def log_visit(req: func.HttpRequest, table_service: TableServiceClient):
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
     log_table.upsert_entity(log_entity)
+
+
+@app.timer_trigger(schedule="0 0 3 * * *", arg_name="mytimer", run_on_startup=False)
+def cleanup_visitor_logs(mytimer: func.TimerRequest) -> None:
+    """
+    Runs daily at 03:00 UTC. Deletes VisitorLog entries older than RETENTION_DAYS.
+    Since PartitionKey is the visit date in 'YYYY-MM-DD' format, a lexicographic
+    string comparison correctly matches chronological order — no need to parse
+    dates or scan the whole table.
+    """
+    logging.info("Visitor log cleanup function triggered.")
+
+    cutoff_date = (datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)).strftime("%Y-%m-%d")
+
+    connection_string = os.environ["COSMOS_CONNECTION_STRING"]
+    table_service = TableServiceClient.from_connection_string(connection_string)
+    log_table = table_service.get_table_client(table_name="VisitorLog")
+
+    query_filter = f"PartitionKey lt '{cutoff_date}'"
+    old_entities = log_table.query_entities(query_filter=query_filter)
+
+    deleted_count = 0
+    for entity in old_entities:
+        try:
+            log_table.delete_entity(partition_key=entity["PartitionKey"], row_key=entity["RowKey"])
+            deleted_count += 1
+        except Exception as e:
+            logging.warning(
+                f"Failed to delete log entry {entity['PartitionKey']}/{entity['RowKey']}: {e}"
+            )
+
+    logging.info(
+        f"Visitor log cleanup complete. Deleted {deleted_count} entries older than {cutoff_date} "
+        f"(retention: {RETENTION_DAYS} days)."
+    )
