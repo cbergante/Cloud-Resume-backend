@@ -46,10 +46,23 @@ def visitorcounter(req: func.HttpRequest) -> func.HttpResponse:
     )
 
 
+def strip_port(ip_address: str) -> str:
+    """
+    X-Forwarded-For sometimes includes the source port (e.g. '200.225.115.56:4740').
+    A bare IPv4 address has zero colons; 'ipv4:port' has exactly one. IPv6 addresses
+    have multiple colons and are left untouched (port-appended IPv6 is rare enough
+    here not to be worth the extra bracket-parsing complexity).
+    """
+    if ip_address.count(":") == 1:
+        return ip_address.rsplit(":", 1)[0]
+    return ip_address
+
+
 def log_visit(req: func.HttpRequest, table_service: TableServiceClient):
     ip_address = req.headers.get("X-Forwarded-For", "unknown")
     # X-Forwarded-For can contain a chain of IPs (client, proxies); the first is the real client
     ip_address = ip_address.split(",")[0].strip()
+    ip_address = strip_port(ip_address)
 
     user_agent = req.headers.get("User-Agent", "unknown")
 
