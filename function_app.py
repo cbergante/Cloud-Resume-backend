@@ -213,7 +213,7 @@ def format_duration(seconds) -> str:
     return f"{minutes}m {remaining}s"
 
 
-@app.route(route="/", auth_level=func.AuthLevel.ANONYMOUS)
+@app.route(route="", auth_level=func.AuthLevel.ANONYMOUS)
 def dashboard(req: func.HttpRequest) -> func.HttpResponse:
     """
     Server-rendered private dashboard. Protected by Azure AD (Easy Auth) at
@@ -370,7 +370,7 @@ def clearvisitorlogs(req: func.HttpRequest) -> func.HttpResponse:
 
     logging.info(f"Cleared all visitor log entries. Deleted {deleted_count}.")
 
-    return func.HttpResponse(status_code=302, headers={"Location": "/api/dashboard"})
+    return func.HttpResponse(status_code=302, headers={"Location": "/"})
 
 
 @app.timer_trigger(schedule="0 0 3 * * *", arg_name="mytimer", run_on_startup=False)
