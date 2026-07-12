@@ -17,7 +17,7 @@ RETENTION_DAYS = 365
 # ---------------------------------------------------------------------------
 # PUBLIC: visitor counter (excluded from Azure AD auth — see portal setup notes)
 # ---------------------------------------------------------------------------
-@app.route(route="api/visitorcounter")
+@app.route(route="visitorcounter")
 def visitorcounter(req: func.HttpRequest) -> func.HttpResponse:
     logging.info('Visitor counter function triggered.')
 
@@ -135,7 +135,7 @@ def log_visit(req: func.HttpRequest, table_service: TableServiceClient):
 # visitor leaves the page, so it must stay anonymous/excluded from Azure AD
 # just like visitorcounter.
 # ---------------------------------------------------------------------------
-@app.route(route="api/logduration", methods=["POST"])
+@app.route(route="logduration", methods=["POST"])
 def logduration(req: func.HttpRequest) -> func.HttpResponse:
     try:
         body = req.get_json()
@@ -213,7 +213,7 @@ def format_duration(seconds) -> str:
     return f"{minutes}m {remaining}s"
 
 
-@app.route(route="", auth_level=func.AuthLevel.ANONYMOUS)
+@app.route(route="dashboard", auth_level=func.AuthLevel.ANONYMOUS)
 def dashboard(req: func.HttpRequest) -> func.HttpResponse:
     """
     Server-rendered private dashboard. Protected by Azure AD (Easy Auth) at
@@ -333,7 +333,7 @@ def dashboard(req: func.HttpRequest) -> func.HttpResponse:
     return func.HttpResponse(body=page, mimetype="text/html", status_code=200)
 
 
-@app.route(route="api/getvisitorlogs", auth_level=func.AuthLevel.ANONYMOUS)
+@app.route(route="getvisitorlogs", auth_level=func.AuthLevel.ANONYMOUS)
 def getvisitorlogs(req: func.HttpRequest) -> func.HttpResponse:
     """JSON API version of the log data. Protected by Azure AD via Easy Auth."""
     connection_string = os.environ["COSMOS_CONNECTION_STRING"]
@@ -353,7 +353,7 @@ def getvisitorlogs(req: func.HttpRequest) -> func.HttpResponse:
     )
 
 
-@app.route(route="api/clearvisitorlogs", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
+@app.route(route="clearvisitorlogs", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
 def clearvisitorlogs(req: func.HttpRequest) -> func.HttpResponse:
     """Deletes every entry in VisitorLog. Protected by Azure AD via Easy Auth."""
     connection_string = os.environ["COSMOS_CONNECTION_STRING"]
@@ -370,7 +370,7 @@ def clearvisitorlogs(req: func.HttpRequest) -> func.HttpResponse:
 
     logging.info(f"Cleared all visitor log entries. Deleted {deleted_count}.")
 
-    return func.HttpResponse(status_code=302, headers={"Location": "/"})
+    return func.HttpResponse(status_code=302, headers={"Location": "/api/dashboard"})
 
 
 @app.timer_trigger(schedule="0 0 3 * * *", arg_name="mytimer", run_on_startup=False)
