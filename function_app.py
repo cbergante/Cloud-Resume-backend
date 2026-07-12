@@ -12,6 +12,8 @@ from azure.core.exceptions import ResourceNotFoundError
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 
 RETENTION_DAYS = 365
+MAX_NAME_LENGTH = 50
+MAX_MESSAGE_LENGTH = 500
 
 
 # ---------------------------------------------------------------------------
@@ -40,10 +42,6 @@ def visitorcounter(req: func.HttpRequest) -> func.HttpResponse:
 
     table_client.upsert_entity(entity)
 
-    # Log this visit (IP, location, browser) — failures here must never
-    # break the actual visitor count response above. Returns the visit's
-    # date/row-key so the front end can later report time-on-site for
-    # this specific visit via /api/logduration.
     visit_date = None
     visit_id = None
     try:
@@ -64,25 +62,14 @@ def visitorcounter(req: func.HttpRequest) -> func.HttpResponse:
 
 
 def strip_port(ip_address: str) -> str:
-    """
-    X-Forwarded-For sometimes includes the source port (e.g. '200.225.115.56:4740').
-    A bare IPv4 address has zero colons; 'ipv4:port' has exactly one. IPv6 addresses
-    have multiple colons and are left untouched.
-    """
     if ip_address.count(":") == 1:
         return ip_address.rsplit(":", 1)[0]
     return ip_address
 
 
 def log_visit(req: func.HttpRequest, table_service: TableServiceClient):
-    """
-    Logs one visit. Returns (partition_key, row_key) so the caller can later
-    attach a time-on-site duration to this exact entry, or (None, None) if
-    logging was skipped (e.g. automated test traffic).
-    """
     user_agent = req.headers.get("User-Agent", "unknown")
 
-    # Don't log our own CI/CD smoke tests as real visitor traffic.
     if "playwright" in user_agent.lower():
         logging.info("Skipping visit log: Playwright test traffic.")
         return None, None
@@ -131,9 +118,7 @@ def log_visit(req: func.HttpRequest, table_service: TableServiceClient):
 
 
 # ---------------------------------------------------------------------------
-# PUBLIC: time-on-site beacon. Called via navigator.sendBeacon() when a
-# visitor leaves the page, so it must stay anonymous/excluded from Azure AD
-# just like visitorcounter.
+# PUBLIC: time-on-site beacon.
 # ---------------------------------------------------------------------------
 @app.route(route="logduration", methods=["POST"])
 def logduration(req: func.HttpRequest) -> func.HttpResponse:
@@ -159,8 +144,6 @@ def logduration(req: func.HttpRequest) -> func.HttpResponse:
             "RowKey": row_key,
             "duration_seconds": duration_seconds
         }
-        # Merge, not replace — only adds/updates this one field, leaving the
-        # rest of the log entry (IP, location, etc.) exactly as it was.
         log_table.update_entity(update_entity, mode=UpdateMode.MERGE)
     except Exception as e:
         logging.warning(f"Failed to log duration for {row_key}: {e}")
@@ -169,9 +152,98 @@ def logduration(req: func.HttpRequest) -> func.HttpResponse:
 
 
 # ---------------------------------------------------------------------------
+# PUBLIC: comments. Anyone can post or read; only the authenticated dashboard
+# can delete. These two routes must stay excluded from Azure AD (see portal
+# setup notes) since real visitors call them anonymously.
+# ---------------------------------------------------------------------------
+@app.route(route="getcomments")
+def getcomments(req: func.HttpRequest) -> func.HttpResponse:
+    connection_string = os.environ["COSMOS_CONNECTION_STRING"]
+    table_service = TableServiceClient.from_connection_string(connection_string)
+    comments_table = table_service.get_table_client(table_name="Comments")
+
+    results = []
+    for entity in comments_table.list_entities():
+        results.append({
+            "partition_key": entity.get("PartitionKey", ""),
+            "row_key": entity.get("RowKey", ""),
+            "name": entity.get("name", ""),
+            "message": entity.get("message", ""),
+            "timestamp": entity.get("timestamp", "")
+        })
+    results.sort(key=lambda c: c["timestamp"], reverse=True)
+
+    return func.HttpResponse(
+        body=json.dumps(results),
+        mimetype="application/json",
+        status_code=200
+    )
+
+
+@app.route(route="postcomment", methods=["POST"])
+def postcomment(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        body = req.get_json()
+    except ValueError:
+        return func.HttpResponse(status_code=400, body="Invalid request body")
+
+    # Honeypot: this field is invisible to real visitors via CSS. Bots that
+    # blindly fill every form field will trip it; silently drop the
+    # submission without giving any indication it was rejected.
+    if body.get("website"):
+        logging.info("Comment submission rejected: honeypot field filled.")
+        return func.HttpResponse(status_code=200, body=json.dumps({"status": "ok"}))
+
+    name = (body.get("name") or "").strip()
+    message = (body.get("message") or "").strip()
+
+    if not name or not message:
+        return func.HttpResponse(status_code=400, body="Name and message are required")
+
+    name = name[:MAX_NAME_LENGTH]
+    message = message[:MAX_MESSAGE_LENGTH]
+
+    connection_string = os.environ["COSMOS_CONNECTION_STRING"]
+    table_service = TableServiceClient.from_connection_string(connection_string)
+    comments_table = table_service.get_table_client(table_name="Comments")
+
+    entity = {
+        "PartitionKey": "comment",
+        "RowKey": str(uuid.uuid4()),
+        "name": name,
+        "message": message,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+    comments_table.upsert_entity(entity)
+
+    return func.HttpResponse(
+        body=json.dumps({"status": "ok"}),
+        mimetype="application/json",
+        status_code=201
+    )
+
+
+@app.route(route="deletecomment", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
+def deletecomment(req: func.HttpRequest) -> func.HttpResponse:
+    """Protected by Azure AD via Easy Auth (not excluded)."""
+    partition_key = req.form.get("partition_key") if req.form else None
+    row_key = req.form.get("row_key") if req.form else None
+
+    if partition_key and row_key:
+        try:
+            connection_string = os.environ["COSMOS_CONNECTION_STRING"]
+            table_service = TableServiceClient.from_connection_string(connection_string)
+            comments_table = table_service.get_table_client(table_name="Comments")
+            comments_table.delete_entity(partition_key=partition_key, row_key=row_key)
+        except Exception as e:
+            logging.warning(f"Failed to delete comment {partition_key}/{row_key}: {e}")
+
+    return func.HttpResponse(status_code=302, headers={"Location": "/api/dashboard"})
+
+
+# ---------------------------------------------------------------------------
 # PRIVATE: everything below requires Azure AD sign-in (enforced at the
-# platform level via Easy Auth). These functions use Anonymous auth_level
-# because Easy Auth already gates access before a request reaches this code.
+# platform level via Easy Auth).
 # ---------------------------------------------------------------------------
 
 def get_visitor_count(table_service: TableServiceClient) -> int:
@@ -200,6 +272,21 @@ def get_recent_logs(table_service: TableServiceClient, limit: int = 200) -> list
     return results[:limit]
 
 
+def get_all_comments(table_service: TableServiceClient) -> list:
+    comments_table = table_service.get_table_client(table_name="Comments")
+    results = []
+    for entity in comments_table.list_entities():
+        results.append({
+            "partition_key": entity.get("PartitionKey", ""),
+            "row_key": entity.get("RowKey", ""),
+            "name": entity.get("name", ""),
+            "message": entity.get("message", ""),
+            "timestamp": entity.get("timestamp", "")
+        })
+    results.sort(key=lambda c: c["timestamp"], reverse=True)
+    return results
+
+
 def format_duration(seconds) -> str:
     if seconds is None or seconds == "":
         return "—"
@@ -215,23 +302,15 @@ def format_duration(seconds) -> str:
 
 @app.route(route="dashboard", auth_level=func.AuthLevel.ANONYMOUS)
 def dashboard(req: func.HttpRequest) -> func.HttpResponse:
-    """
-    Server-rendered private dashboard. Protected by Azure AD (Easy Auth) at
-    the platform level — this route is NOT in the excluded-paths list, so
-    Azure redirects unauthenticated visitors to Microsoft sign-in before this
-    code ever runs.
-    """
     connection_string = os.environ["COSMOS_CONNECTION_STRING"]
     table_service = TableServiceClient.from_connection_string(connection_string)
 
     count = get_visitor_count(table_service)
     logs = get_recent_logs(table_service)
+    comments = get_all_comments(table_service)
 
     rows_html = ""
     for row in logs:
-        # Every field here is visitor-supplied (esp. user_agent, fully attacker-
-        # controlled) — escape before embedding in HTML to prevent stored XSS
-        # against whoever views this authenticated dashboard.
         rows_html += f"""
         <tr>
           <td>{html.escape(row['timestamp'])}</td>
@@ -242,6 +321,23 @@ def dashboard(req: func.HttpRequest) -> func.HttpResponse:
           <td>{html.escape(format_duration(row['duration_seconds']))}</td>
           <td>{html.escape(row['user_agent'])}</td>
         </tr>"""
+
+    comments_html = ""
+    if not comments:
+        comments_html = "<p>No comments yet.</p>"
+    for c in comments:
+        comments_html += f"""
+        <div class="comment-mod-item">
+          <strong>{html.escape(c['name'])}</strong>
+          <span class="comment-mod-date">{html.escape(c['timestamp'])}</span>
+          <div class="comment-mod-message">{html.escape(c['message'])}</div>
+          <form method="POST" action="/api/deletecomment"
+                onsubmit="return confirm('Delete this comment permanently?');">
+            <input type="hidden" name="partition_key" value="{html.escape(c['partition_key'])}">
+            <input type="hidden" name="row_key" value="{html.escape(c['row_key'])}">
+            <button type="submit" class="danger small">Delete</button>
+          </form>
+        </div>"""
 
     page = f"""<!DOCTYPE html>
 <html lang="en">
@@ -258,7 +354,8 @@ def dashboard(req: func.HttpRequest) -> func.HttpResponse:
       margin: 0;
       padding: 20px;
     }}
-    h1 {{ font-family: "Courier New", Consolas, monospace; color: #0F0; }}
+    h1, h2 {{ font-family: "Courier New", Consolas, monospace; color: #0F0; }}
+    h2 {{ font-size: 1.2em; margin-top: 30px; }}
     .count-box {{
       display: inline-block;
       border: 1px solid #0F0;
@@ -281,18 +378,21 @@ def dashboard(req: func.HttpRequest) -> func.HttpResponse:
       margin-right: 8px;
     }}
     .controls button.danger {{ color: #f55; border-color: #f55; }}
+    button.danger.small {{
+      color: #f55; border-color: #f55; background-color: #111;
+      border: 1px solid #f55; border-radius: 4px; padding: 4px 10px;
+      font-family: "Courier New", Consolas, monospace; cursor: pointer; margin-top: 6px;
+    }}
     table {{ width: 100%; border-collapse: collapse; font-size: 0.9em; }}
     th, td {{
-      text-align: left;
-      padding: 8px 10px;
-      border-bottom: 1px solid #333;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      max-width: 240px;
+      text-align: left; padding: 8px 10px; border-bottom: 1px solid #333;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 240px;
     }}
     th {{ color: #0F0; font-family: "Courier New", Consolas, monospace; }}
     tr:hover {{ background-color: #111; }}
+    .comment-mod-item {{ border-bottom: 1px solid #333; padding: 10px 0; }}
+    .comment-mod-date {{ font-size: 0.8em; color: #888; margin-left: 8px; }}
+    .comment-mod-message {{ margin-top: 4px; white-space: pre-wrap; word-wrap: break-word; }}
   </style>
 </head>
 <body>
@@ -327,6 +427,10 @@ def dashboard(req: func.HttpRequest) -> func.HttpResponse:
     <tbody>{rows_html}
     </tbody>
   </table>
+
+  <h2>Comments ({len(comments)})</h2>
+  {comments_html}
+
 </body>
 </html>"""
 
@@ -335,7 +439,6 @@ def dashboard(req: func.HttpRequest) -> func.HttpResponse:
 
 @app.route(route="getvisitorlogs", auth_level=func.AuthLevel.ANONYMOUS)
 def getvisitorlogs(req: func.HttpRequest) -> func.HttpResponse:
-    """JSON API version of the log data. Protected by Azure AD via Easy Auth."""
     connection_string = os.environ["COSMOS_CONNECTION_STRING"]
     table_service = TableServiceClient.from_connection_string(connection_string)
 
@@ -355,7 +458,6 @@ def getvisitorlogs(req: func.HttpRequest) -> func.HttpResponse:
 
 @app.route(route="clearvisitorlogs", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
 def clearvisitorlogs(req: func.HttpRequest) -> func.HttpResponse:
-    """Deletes every entry in VisitorLog. Protected by Azure AD via Easy Auth."""
     connection_string = os.environ["COSMOS_CONNECTION_STRING"]
     table_service = TableServiceClient.from_connection_string(connection_string)
     log_table = table_service.get_table_client(table_name="VisitorLog")
@@ -375,11 +477,6 @@ def clearvisitorlogs(req: func.HttpRequest) -> func.HttpResponse:
 
 @app.timer_trigger(schedule="0 0 3 * * *", arg_name="mytimer", run_on_startup=False)
 def cleanup_visitor_logs(mytimer: func.TimerRequest) -> None:
-    """
-    Runs daily at 03:00 UTC. Deletes VisitorLog entries older than
-    RETENTION_DAYS, using the date-string PartitionKey for an efficient
-    lexicographic range query.
-    """
     logging.info("Visitor log cleanup function triggered.")
 
     cutoff_date = (datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)).strftime("%Y-%m-%d")
