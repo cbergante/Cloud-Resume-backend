@@ -6,7 +6,7 @@ import json
 import html
 import requests
 from datetime import datetime, timedelta, timezone
-from azure.data.tables import TableServiceClient
+from azure.data.tables import TableServiceClient, UpdateMode
 from azure.core.exceptions import ResourceNotFoundError
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
@@ -17,7 +17,7 @@ RETENTION_DAYS = 365
 # ---------------------------------------------------------------------------
 # PUBLIC: visitor counter (excluded from Azure AD auth — see portal setup notes)
 # ---------------------------------------------------------------------------
-@app.route(route="visitorcounter")
+@app.route(route="api/visitorcounter")
 def visitorcounter(req: func.HttpRequest) -> func.HttpResponse:
     logging.info('Visitor counter function triggered.')
 
@@ -41,14 +41,23 @@ def visitorcounter(req: func.HttpRequest) -> func.HttpResponse:
     table_client.upsert_entity(entity)
 
     # Log this visit (IP, location, browser) — failures here must never
-    # break the actual visitor count response above.
+    # break the actual visitor count response above. Returns the visit's
+    # date/row-key so the front end can later report time-on-site for
+    # this specific visit via /api/logduration.
+    visit_date = None
+    visit_id = None
     try:
-        log_visit(req, table_service)
+        visit_date, visit_id = log_visit(req, table_service)
     except Exception as e:
         logging.warning(f"Visit logging failed (counter still succeeded): {e}")
 
+    response_body = {"count": entity["count"]}
+    if visit_id:
+        response_body["visit_id"] = visit_id
+        response_body["visit_date"] = visit_date
+
     return func.HttpResponse(
-        body=f'{{"count": {entity["count"]}}}',
+        body=json.dumps(response_body),
         mimetype="application/json",
         status_code=200
     )
@@ -66,11 +75,21 @@ def strip_port(ip_address: str) -> str:
 
 
 def log_visit(req: func.HttpRequest, table_service: TableServiceClient):
+    """
+    Logs one visit. Returns (partition_key, row_key) so the caller can later
+    attach a time-on-site duration to this exact entry, or (None, None) if
+    logging was skipped (e.g. automated test traffic).
+    """
+    user_agent = req.headers.get("User-Agent", "unknown")
+
+    # Don't log our own CI/CD smoke tests as real visitor traffic.
+    if "playwright" in user_agent.lower():
+        logging.info("Skipping visit log: Playwright test traffic.")
+        return None, None
+
     ip_address = req.headers.get("X-Forwarded-For", "unknown")
     ip_address = ip_address.split(",")[0].strip()
     ip_address = strip_port(ip_address)
-
-    user_agent = req.headers.get("User-Agent", "unknown")
 
     city, region, country = "unknown", "unknown", "unknown"
     if ip_address != "unknown":
@@ -92,10 +111,13 @@ def log_visit(req: func.HttpRequest, table_service: TableServiceClient):
         except requests.exceptions.RequestException as e:
             logging.warning(f"Geo lookup request failed for {ip_address}: {e}")
 
+    partition_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    row_key = str(uuid.uuid4())
+
     log_table = table_service.get_table_client(table_name="VisitorLog")
     log_entity = {
-        "PartitionKey": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-        "RowKey": str(uuid.uuid4()),
+        "PartitionKey": partition_key,
+        "RowKey": row_key,
         "ip_address": ip_address,
         "city": city,
         "region": region,
@@ -105,12 +127,51 @@ def log_visit(req: func.HttpRequest, table_service: TableServiceClient):
     }
     log_table.upsert_entity(log_entity)
 
+    return partition_key, row_key
+
+
+# ---------------------------------------------------------------------------
+# PUBLIC: time-on-site beacon. Called via navigator.sendBeacon() when a
+# visitor leaves the page, so it must stay anonymous/excluded from Azure AD
+# just like visitorcounter.
+# ---------------------------------------------------------------------------
+@app.route(route="api/logduration", methods=["POST"])
+def logduration(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        body = req.get_json()
+    except ValueError:
+        return func.HttpResponse(status_code=400)
+
+    row_key = body.get("row_key")
+    date = body.get("date")
+    duration_seconds = body.get("duration_seconds")
+
+    if not row_key or not date or duration_seconds is None:
+        return func.HttpResponse(status_code=400)
+
+    try:
+        connection_string = os.environ["COSMOS_CONNECTION_STRING"]
+        table_service = TableServiceClient.from_connection_string(connection_string)
+        log_table = table_service.get_table_client(table_name="VisitorLog")
+
+        update_entity = {
+            "PartitionKey": date,
+            "RowKey": row_key,
+            "duration_seconds": duration_seconds
+        }
+        # Merge, not replace — only adds/updates this one field, leaving the
+        # rest of the log entry (IP, location, etc.) exactly as it was.
+        log_table.update_entity(update_entity, mode=UpdateMode.MERGE)
+    except Exception as e:
+        logging.warning(f"Failed to log duration for {row_key}: {e}")
+
+    return func.HttpResponse(status_code=204)
+
 
 # ---------------------------------------------------------------------------
 # PRIVATE: everything below requires Azure AD sign-in (enforced at the
-# platform level via Easy Auth — see portal setup notes below). These
-# functions use Anonymous auth_level because Easy Auth already gates access
-# before a request ever reaches this code.
+# platform level via Easy Auth). These functions use Anonymous auth_level
+# because Easy Auth already gates access before a request reaches this code.
 # ---------------------------------------------------------------------------
 
 def get_visitor_count(table_service: TableServiceClient) -> int:
@@ -132,13 +193,27 @@ def get_recent_logs(table_service: TableServiceClient, limit: int = 200) -> list
             "region": entity.get("region", ""),
             "country": entity.get("country", ""),
             "user_agent": entity.get("user_agent", ""),
-            "timestamp": entity.get("timestamp", "")
+            "timestamp": entity.get("timestamp", ""),
+            "duration_seconds": entity.get("duration_seconds")
         })
     results.sort(key=lambda x: x["timestamp"], reverse=True)
     return results[:limit]
 
 
-@app.route(route="dashboard", auth_level=func.AuthLevel.ANONYMOUS)
+def format_duration(seconds) -> str:
+    if seconds is None or seconds == "":
+        return "—"
+    try:
+        seconds = int(seconds)
+    except (ValueError, TypeError):
+        return "—"
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, remaining = divmod(seconds, 60)
+    return f"{minutes}m {remaining}s"
+
+
+@app.route(route="", auth_level=func.AuthLevel.ANONYMOUS)
 def dashboard(req: func.HttpRequest) -> func.HttpResponse:
     """
     Server-rendered private dashboard. Protected by Azure AD (Easy Auth) at
@@ -164,6 +239,7 @@ def dashboard(req: func.HttpRequest) -> func.HttpResponse:
           <td>{html.escape(row['city'])}</td>
           <td>{html.escape(row['region'])}</td>
           <td>{html.escape(row['country'])}</td>
+          <td>{html.escape(format_duration(row['duration_seconds']))}</td>
           <td>{html.escape(row['user_agent'])}</td>
         </tr>"""
 
@@ -192,6 +268,19 @@ def dashboard(req: func.HttpRequest) -> func.HttpResponse:
       font-family: "Courier New", Consolas, monospace;
     }}
     .count-box .number {{ font-size: 2em; color: #0F0; }}
+    .controls {{ margin-bottom: 16px; }}
+    .controls a, .controls button {{
+      font-family: "Courier New", Consolas, monospace;
+      color: #0F0;
+      background-color: #111;
+      border: 1px solid #0F0;
+      padding: 8px 12px;
+      border-radius: 4px;
+      text-decoration: none;
+      cursor: pointer;
+      margin-right: 8px;
+    }}
+    .controls button.danger {{ color: #f55; border-color: #f55; }}
     table {{ width: 100%; border-collapse: collapse; font-size: 0.9em; }}
     th, td {{
       text-align: left;
@@ -200,11 +289,10 @@ def dashboard(req: func.HttpRequest) -> func.HttpResponse:
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
-      max-width: 260px;
+      max-width: 240px;
     }}
     th {{ color: #0F0; font-family: "Courier New", Consolas, monospace; }}
     tr:hover {{ background-color: #111; }}
-    a {{ color: #0F0; }}
   </style>
 </head>
 <body>
@@ -215,7 +303,14 @@ def dashboard(req: func.HttpRequest) -> func.HttpResponse:
     <span class="number">{count}</span>
   </div>
 
-  <p><a href="?">Refresh</a> &nbsp;|&nbsp; <a href="/.auth/logout">Sign out</a></p>
+  <div class="controls">
+    <a href="?">Refresh</a>
+    <form method="POST" action="/api/clearvisitorlogs" style="display:inline;"
+          onsubmit="return confirm('Permanently delete ALL visitor log entries? This cannot be undone.');">
+      <button type="submit" class="danger">Clear All Entries</button>
+    </form>
+    <a href="/.auth/logout">Sign out</a>
+  </div>
 
   <table>
     <thead>
@@ -225,6 +320,7 @@ def dashboard(req: func.HttpRequest) -> func.HttpResponse:
         <th>City</th>
         <th>Region</th>
         <th>Country</th>
+        <th>Time on Site</th>
         <th>Browser / OS</th>
       </tr>
     </thead>
@@ -237,12 +333,9 @@ def dashboard(req: func.HttpRequest) -> func.HttpResponse:
     return func.HttpResponse(body=page, mimetype="text/html", status_code=200)
 
 
-@app.route(route="getvisitorlogs", auth_level=func.AuthLevel.ANONYMOUS)
+@app.route(route="api/getvisitorlogs", auth_level=func.AuthLevel.ANONYMOUS)
 def getvisitorlogs(req: func.HttpRequest) -> func.HttpResponse:
-    """
-    JSON API version of the log data, for programmatic access. Also protected
-    by Azure AD via Easy Auth (not in excluded-paths).
-    """
+    """JSON API version of the log data. Protected by Azure AD via Easy Auth."""
     connection_string = os.environ["COSMOS_CONNECTION_STRING"]
     table_service = TableServiceClient.from_connection_string(connection_string)
 
@@ -258,6 +351,26 @@ def getvisitorlogs(req: func.HttpRequest) -> func.HttpResponse:
         mimetype="application/json",
         status_code=200
     )
+
+
+@app.route(route="api/clearvisitorlogs", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
+def clearvisitorlogs(req: func.HttpRequest) -> func.HttpResponse:
+    """Deletes every entry in VisitorLog. Protected by Azure AD via Easy Auth."""
+    connection_string = os.environ["COSMOS_CONNECTION_STRING"]
+    table_service = TableServiceClient.from_connection_string(connection_string)
+    log_table = table_service.get_table_client(table_name="VisitorLog")
+
+    deleted_count = 0
+    for entity in log_table.list_entities():
+        try:
+            log_table.delete_entity(partition_key=entity["PartitionKey"], row_key=entity["RowKey"])
+            deleted_count += 1
+        except Exception as e:
+            logging.warning(f"Failed to delete entity during clear-all: {e}")
+
+    logging.info(f"Cleared all visitor log entries. Deleted {deleted_count}.")
+
+    return func.HttpResponse(status_code=302, headers={"Location": "/api/dashboard"})
 
 
 @app.timer_trigger(schedule="0 0 3 * * *", arg_name="mytimer", run_on_startup=False)
