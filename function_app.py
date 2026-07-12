@@ -213,7 +213,7 @@ def format_duration(seconds) -> str:
     return f"{minutes}m {remaining}s"
 
 
-@app.route(route="", auth_level=func.AuthLevel.ANONYMOUS)
+@app.route(route="/", auth_level=func.AuthLevel.ANONYMOUS)
 def dashboard(req: func.HttpRequest) -> func.HttpResponse:
     """
     Server-rendered private dashboard. Protected by Azure AD (Easy Auth) at
