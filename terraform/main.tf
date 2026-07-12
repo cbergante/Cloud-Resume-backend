@@ -13,6 +13,7 @@ resource "azurerm_storage_account" "function_storage" {
   cross_tenant_replication_enabled  = false
   min_tls_version                   = "TLS1_0"
 }
+
 resource "azurerm_cosmosdb_account" "resume" {
   name                = var.cosmosdb_account_name
   resource_group_name = azurerm_resource_group.api.name
@@ -69,18 +70,19 @@ resource "azurerm_cosmosdb_table" "visitor_counter" {
   resource_group_name = azurerm_resource_group.api.name
   account_name        = azurerm_cosmosdb_account.resume.name
 }
+
+resource "azurerm_cosmosdb_table" "visitor_log" {
+  name                = "VisitorLog"
+  resource_group_name = azurerm_resource_group.api.name
+  account_name        = azurerm_cosmosdb_account.resume.name
+}
+
 resource "azurerm_service_plan" "function_plan" {
   name                = "EastUSLinuxDynamicPlan"
   resource_group_name = azurerm_resource_group.api.name
   location             = azurerm_resource_group.api.location
   os_type              = "Linux"
   sku_name             = "Y1"
-}
-
-resource "azurerm_cosmosdb_table" "visitor_log" {
-  name                = "VisitorLog"
-  resource_group_name = azurerm_resource_group.api.name
-  account_name        = azurerm_cosmosdb_account.resume.name
 }
 
 resource "azurerm_linux_function_app" "resume_api" {
@@ -113,7 +115,19 @@ resource "azurerm_linux_function_app" "resume_api" {
     FUNCTIONS_WORKER_RUNTIME = "python"
   }
 
+  # Several of these are configured outside Terraform (Azure AD sign-in via
+  # the Portal wizard + direct REST API calls, and Application Insights
+  # auto-wired by Azure when Easy Auth was enabled). Terraform doesn't know
+  # about any of it, so without these exclusions it would try to delete all
+  # of it on every apply.
   lifecycle {
-    ignore_changes = [app_settings]
+    ignore_changes = [
+      app_settings,
+      auth_settings_v2,
+      tags,
+      sticky_settings,
+      site_config[0].application_insights_connection_string,
+      site_config[0].application_insights_key,
+    ]
   }
 }
