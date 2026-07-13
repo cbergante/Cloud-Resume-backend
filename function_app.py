@@ -405,6 +405,10 @@ def dashboard(req: func.HttpRequest) -> func.HttpResponse:
 
   <div class="controls">
     <a href="?">Refresh</a>
+    <form method="POST" action="/api/resetcounter" style="display:inline;"
+          onsubmit="return confirm('Reset the public visitor counter to 0? This cannot be undone.');">
+      <button type="submit" class="danger">Reset Counter</button>
+    </form>
     <form method="POST" action="/api/clearvisitorlogs" style="display:inline;"
           onsubmit="return confirm('Permanently delete ALL visitor log entries? This cannot be undone.');">
       <button type="submit" class="danger">Clear All Entries</button>
@@ -471,6 +475,24 @@ def clearvisitorlogs(req: func.HttpRequest) -> func.HttpResponse:
             logging.warning(f"Failed to delete entity during clear-all: {e}")
 
     logging.info(f"Cleared all visitor log entries. Deleted {deleted_count}.")
+
+    return func.HttpResponse(status_code=302, headers={"Location": "/api/dashboard"})
+
+
+@app.route(route="resetcounter", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
+def resetcounter(req: func.HttpRequest) -> func.HttpResponse:
+    """Resets the public visitor counter back to 0. Protected by Azure AD via Easy Auth."""
+    connection_string = os.environ["COSMOS_CONNECTION_STRING"]
+    table_service = TableServiceClient.from_connection_string(connection_string)
+    table_client = table_service.get_table_client(table_name="VisitorCounter")
+
+    entity = {
+        "PartitionKey": "site",
+        "RowKey": "counter",
+        "count": 0
+    }
+    table_client.upsert_entity(entity)
+    logging.info("Visitor counter reset to 0.")
 
     return func.HttpResponse(status_code=302, headers={"Location": "/api/dashboard"})
 
